@@ -1,40 +1,63 @@
 const express = require('express');
-const multer = require('multer');
 const cors = require('cors');
+const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
+const fs = require('fs').promises;
 const pdfParse = require('pdf-parse');
-const axios = require('axios');
+const Groq = require('groq-sdk');
+const translate = require('@iamtraction/google-translate');
+const { v4: uuidv4 } = require('uuid');
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
+
+// Initialize Groq AI (FREE and FAST!)
+// Get your FREE API key from: https://console.groq.com/keys
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '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';
+
+// Validate API key on startup
+if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY') {
+  console.error('\n⚠️  ERROR: Groq API key is not set!');
+  console.error('Please follow these steps:');
+  console.error('1. Go to: https://console.groq.com/keys');
+  console.error('2. Sign up for FREE (no credit card required)');
+  console.error('3. Create an API key');
+  console.error('4. Set it as environment variable:');
+  console.error('   - Windows: set GROQ_API_KEY=your_key_here');
+  console.error('   - Linux/Mac: export GROQ_API_KEY=your_key_here');
+  console.error('   - Or replace "YOUR_GROQ_API_KEY" in server.js line 14\n');
+}
+
+const groq = new Groq({
+  apiKey: GROQ_API_KEY
+});
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 app.use('/uploads', express.static('uploads'));
 
-// GROQ API Configuration - Get free API key from https://console.groq.com/keys
-const GROQ_API_KEY = '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';
-const GROQ_API_URL =  'https://api.groq.com/openai/v1/chat/completions';
-
-// Create uploads directory
-if (!fs.existsSync('uploads')) {
-  fs.mkdirSync('uploads');
-}
-
-// Configure multer
+// Configure multer for file uploads
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => {
-    cb(null, 'uploads/');
+  destination: async (req, file, cb) => {
+    const uploadDir = 'uploads';
+    try {
+      await fs.mkdir(uploadDir, { recursive: true });
+    } catch (error) {
+      console.error('Error creating upload directory:', error);
+    }
+    cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
-    cb(null, Date.now() + '-' + file.originalname);
+    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
+    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
 
-const upload = multer({
+const upload = multer({ 
   storage: storage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB limit
   fileFilter: (req, file, cb) => {
     if (file.mimetype === 'application/pdf') {
       cb(null, true);
@@ -44,429 +67,307 @@ const upload = multer({
   }
 });
 
-// Store PDF content
-let pdfDatabase = [];
+// Store uploaded PDF content in memory (in production, use a database)
+const pdfStorage = new Map();
 
-// Load existing PDFs on startup
-async function loadExistingPDFs() {
-  const uploadsDir = 'uploads';
-  if (fs.existsSync(uploadsDir)) {
-    const files = fs.readdirSync(uploadsDir);
-    for (const file of files) {
-      if (file.endsWith('.pdf')) {
-        try {
-          const filePath = path.join(uploadsDir, file);
-          const text = await extractTextFromPDF(filePath);
-          pdfDatabase.push({
-            id: Date.now().toString() + Math.random(),
-            filename: file,
-            originalName: file.replace(/^\d+-/, ''),
-            path: filePath,
-            text: text,
-            uploadDate: fs.statSync(filePath).birthtime
-          });
-        } catch (error) {
-          console.error(`Error loading ${file}:`, error);
-        }
+// Language detection and translation helper
+async function detectAndTranslate(text, targetLang = 'auto') {
+  try {
+    if (targetLang === 'auto') {
+      // Detect language
+      const detection = await translate(text, { to: 'en' });
+      return { 
+        detectedLanguage: detection.from.language.iso,
+        text: text 
+      };
+    } else {
+      // Translate to target language
+      const result = await translate(text, { to: targetLang });
+      return {
+        translatedText: result.text,
+        originalText: text,
+        from: result.from.language.iso,
+        to: targetLang
+      };
+    }
+  } catch (error) {
+    console.error('Translation error:', error);
+    return { text: text, error: 'Translation failed' };
+  }
+}
+
+// AI response generation using Groq
+async function generateAIResponse(question, context = '', language = 'en') {
+  try {
+    // Check if API key is valid
+    if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY') {
+      return '❌ Error: Groq API key is not configured. Please set up your API key. Visit: https://console.groq.com/keys';
+    }
+
+    // Build the messages
+    const messages = [
+      {
+        role: 'system',
+        content: 'You are a helpful assistant that answers questions accurately and concisely. If context from documents is provided, use it to answer the question. If the question is in a language other than English, respond in that same language.'
+      }
+    ];
+
+    // Add context if available
+    if (context) {
+      messages.push({
+        role: 'system',
+        content: `Context from uploaded documents:\n${context}`
+      });
+    }
+
+    // Add user question
+    messages.push({
+      role: 'user',
+      content: question
+    });
+
+    // Generate response using Groq (using Llama 3 - very fast and free!)
+    const chatCompletion = await groq.chat.completions.create({
+      messages: messages,
+      model: 'llama-3.3-70b-versatile', // Fast, free, and powerful
+      temperature: 0.7,
+      max_tokens: 1024,
+      top_p: 1,
+      stream: false
+    });
+
+    let answer = chatCompletion.choices[0]?.message?.content || 'No response generated';
+
+    // If the question was in a specific language, ensure the response is in that language
+    if (language !== 'en' && language !== 'auto') {
+      try {
+        const translated = await translate(answer, { to: language });
+        answer = translated.text;
+      } catch (error) {
+        console.error('Failed to translate response:', error);
       }
     }
-    console.log(`📚 Loaded ${pdfDatabase.length} existing PDFs`);
-  }
-}
 
-// Extract text from PDF
-async function extractTextFromPDF(filePath) {
-  try {
-    const dataBuffer = fs.readFileSync(filePath);
-    const data = await pdfParse(dataBuffer);
-    return data.text;
+    return answer;
   } catch (error) {
-    console.error('Error extracting text from PDF:', error);
-    return '';
-  }
-}
+    console.error('AI generation error:', error);
+    
+    // Handle specific Groq errors
+    if (error.message && error.message.includes('API key')) {
+      return '❌ Invalid API Key Error: Please check your Groq API key. Get a free key from https://console.groq.com/keys';
+    }
+    
+    if (error.message && error.message.includes('rate limit')) {
+      return '⚠️ Rate Limit: Please wait a moment and try again. Groq has generous free limits.';
+    }
 
-// Call Groq API
-async function callGroqAPI(prompt) {
-  try {
-    const response = await axios.post(
-      GROQ_API_URL,
-      {
-        model: "llama-3.1-8b-instant", // Free model
-        messages: [
-          {
-            role: "system",
-            content: "You are a knowledgeable and respectful assistant about Lord Swaminarayan. Keep answers concise (2-3 sentences maximum)."
-          },
-          {
-            role: "user",
-            content: prompt
-          }
-        ],
-        temperature: 0.7,
-        max_tokens: 150
-      },
-      {
-        headers: {
-          'Authorization': `Bearer ${GROQ_API_KEY}`,
-          'Content-Type': 'application/json'
-        }
+    if (error.status === 401) {
+      return '❌ Authentication Error: Invalid Groq API key. Please get a new key from https://console.groq.com/keys';
+    }
+    
+    // Fallback responses for common Gujarati questions
+    const gujaratiResponses = {
+      'swaminarayan': 'Swaminarayan Bhagwan no janma 3 April 1781 ma Chhapaiya gaame thayo hato. Temnun asli naam Ghanshyam Pande hatu.',
+      'chhapaiya': 'Chhapaiya ek nanu gaamu che je Uttar Pradesh, Bharat ma aavelu che. Ahin Swaminarayan Bhagwan no janma thayo hato.',
+    };
+    
+    // Check for keywords in question
+    const lowerQuestion = question.toLowerCase();
+    for (const [key, value] of Object.entries(gujaratiResponses)) {
+      if (lowerQuestion.includes(key)) {
+        return value;
       }
-    );
-
-    return response.data.choices[0].message.content;
-  } catch (error) {
-    console.error('Groq API Error:', error.response?.data || error.message);
-    throw error;
+    }
+    
+    return `I apologize, but I encountered an error: ${error.message}. Please try again.`;
   }
 }
 
-// Serve web upload interface
-app.get('/upload', (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Swaminarayan PDF Upload</title>
-      <meta name="viewport" content="width=device-width, initial-scale=1">
-      <style>
-        body {
-          font-family: Arial, sans-serif;
-          max-width: 800px;
-          margin: 0 auto;
-          padding: 20px;
-          background: #FFF5E6;
-        }
-        h1 {
-          color: #FF6B35;
-        }
-        .upload-area {
-          border: 2px dashed #FF6B35;
-          border-radius: 10px;
-          padding: 30px;
-          text-align: center;
-          background: white;
-          margin: 20px 0;
-        }
-        input[type="file"] {
-          display: none;
-        }
-        .upload-btn {
-          background: #FF6B35;
-          color: white;
-          padding: 12px 24px;
-          border: none;
-          border-radius: 5px;
-          cursor: pointer;
-          font-size: 16px;
-        }
-        .upload-btn:hover {
-          background: #E55A2B;
-        }
-        .pdf-list {
-          background: white;
-          border-radius: 10px;
-          padding: 20px;
-          margin-top: 20px;
-        }
-        .pdf-item {
-          padding: 10px;
-          border-bottom: 1px solid #eee;
-          display: flex;
-          justify-content: space-between;
-          align-items: center;
-        }
-        .delete-btn {
-          background: #f44336;
-          color: white;
-          border: none;
-          padding: 5px 10px;
-          border-radius: 3px;
-          cursor: pointer;
-        }
-        .status {
-          padding: 10px;
-          margin: 10px 0;
-          border-radius: 5px;
-          display: none;
-        }
-        .success {
-          background: #4CAF50;
-          color: white;
-        }
-        .error {
-          background: #f44336;
-          color: white;
-        }
-        .info-box {
-          background: #E3F2FD;
-          border: 1px solid #2196F3;
-          border-radius: 5px;
-          padding: 15px;
-          margin: 20px 0;
-        }
-        .info-box h3 {
-          margin-top: 0;
-          color: #1976D2;
-        }
-      </style>
-    </head>
-    <body>
-      <h1>📚 Swaminarayan PDF Library</h1>
-      
-      <div class="info-box">
-        <h3>🤖 Using Groq AI (Free & Fast)</h3>
-        <p>This demo uses Groq's free AI API with Llama 3 model for intelligent responses.</p>
-        <p>To activate: Get a free API key from <a href="https://console.groq.com/keys" target="_blank">console.groq.com/keys</a> and update server.js</p>
-      </div>
-      
-      <div class="upload-area">
-        <h2>Upload PDF Files</h2>
-        <p>Select PDFs about Lord Swaminarayan</p>
-        <input type="file" id="fileInput" accept=".pdf" multiple>
-        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
-          Choose PDFs
-        </button>
-      </div>
-      
-      <div id="status" class="status"></div>
-      
-      <div class="pdf-list">
-        <h2>Uploaded PDFs</h2>
-        <div id="pdfList">Loading...</div>
-      </div>
-      
-      <script>
-        async function loadPDFs() {
-          try {
-            const response = await fetch('/api/pdfs');
-            const pdfs = await response.json();
-            const listEl = document.getElementById('pdfList');
-            
-            if (pdfs.length === 0) {
-              listEl.innerHTML = '<p>No PDFs uploaded yet</p>';
-            } else {
-              listEl.innerHTML = pdfs.map(pdf => \`
-                <div class="pdf-item">
-                  <span>📄 \${pdf.filename}</span>
-                  <button class="delete-btn" onclick="deletePDF('\${pdf.id}')">Delete</button>
-                </div>
-              \`).join('');
-            }
-          } catch (error) {
-            console.error('Error loading PDFs:', error);
-          }
-        }
-        
-        async function deletePDF(id) {
-          if (!confirm('Delete this PDF?')) return;
-          
-          try {
-            await fetch(\`/api/pdfs/\${id}\`, { method: 'DELETE' });
-            showStatus('PDF deleted successfully', 'success');
-            loadPDFs();
-          } catch (error) {
-            showStatus('Error deleting PDF', 'error');
-          }
-        }
-        
-        function showStatus(message, type) {
-          const status = document.getElementById('status');
-          status.textContent = message;
-          status.className = 'status ' + type;
-          status.style.display = 'block';
-          setTimeout(() => {
-            status.style.display = 'none';
-          }, 3000);
-        }
-        
-        document.getElementById('fileInput').addEventListener('change', async (e) => {
-          const files = e.target.files;
-          
-          for (let file of files) {
-            const formData = new FormData();
-            formData.append('pdf', file);
-            
-            try {
-              const response = await fetch('/api/upload-pdf', {
-                method: 'POST',
-                body: formData
-              });
-              
-              if (response.ok) {
-                showStatus(\`Uploaded \${file.name} successfully\`, 'success');
-              } else {
-                showStatus(\`Error uploading \${file.name}\`, 'error');
-              }
-            } catch (error) {
-              showStatus(\`Error uploading \${file.name}\`, 'error');
-            }
-          }
-          
-          e.target.value = '';
-          setTimeout(loadPDFs, 500);
-        });
-        
-        loadPDFs();
-        setInterval(loadPDFs, 5000);
-      </script>
-    </body>
-    </html>
-  `);
+// Routes
+
+// Health check
+app.get('/health', (req, res) => {
+  const apiKeyStatus = GROQ_API_KEY && GROQ_API_KEY !== 'YOUR_GROQ_API_KEY' 
+    ? '✅ Configured' 
+    : '❌ Not configured';
+  
+  res.json({ 
+    status: 'healthy', 
+    timestamp: new Date().toISOString(),
+    apiKey: apiKeyStatus,
+    aiProvider: 'Groq (Free)'
+  });
 });
 
-// Upload PDF
+// Upload PDF endpoint
 app.post('/api/upload-pdf', upload.single('pdf'), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({ error: 'No PDF file uploaded' });
+      return res.status(400).json({ error: 'No file uploaded' });
     }
 
-    const filePath = req.file.path;
-    const text = await extractTextFromPDF(filePath);
-
-    const pdfData = {
-      id: Date.now().toString(),
-      filename: req.file.filename,
-      originalName: req.file.originalname,
-      path: filePath,
-      text: text,
-      uploadDate: new Date()
-    };
-
-    pdfDatabase.push(pdfData);
+    const filePath = path.join('uploads', req.file.filename);
+    const dataBuffer = await fs.readFile(filePath);
+    
+    // Parse PDF
+    const pdfData = await pdfParse(dataBuffer);
+    
+    // Store PDF data
+    const fileId = uuidv4();
+    pdfStorage.set(fileId, {
+      filename: req.file.originalname,
+      text: pdfData.text,
+      numPages: pdfData.numpages,
+      info: pdfData.info,
+      uploadedAt: new Date().toISOString(),
+      filePath: filePath
+    });
 
     res.json({
       success: true,
-      message: 'PDF uploaded and processed successfully',
-      pdf: {
-        id: pdfData.id,
-        filename: pdfData.originalName,
-        size: req.file.size
-      }
+      fileId: fileId,
+      filename: req.file.originalname,
+      numPages: pdfData.numpages,
+      textLength: pdfData.text.length,
+      info: pdfData.info
     });
   } catch (error) {
-    console.error('Error uploading PDF:', error);
-    res.status(500).json({ error: 'Failed to process PDF' });
+    console.error('PDF upload error:', error);
+    res.status(500).json({ error: 'Failed to process PDF', details: error.message });
   }
 });
 
-// Get all PDFs
-app.get('/api/pdfs', (req, res) => {
-  const pdfList = pdfDatabase.map(pdf => ({
-    id: pdf.id,
-    filename: pdf.originalName,
-    uploadDate: pdf.uploadDate
-  }));
-  res.json(pdfList);
-});
-
-// Delete PDF
-app.delete('/api/pdfs/:id', (req, res) => {
-  const pdfId = req.params.id;
-  const pdfIndex = pdfDatabase.findIndex(pdf => pdf.id === pdfId);
-
-  if (pdfIndex === -1) {
-    return res.status(404).json({ error: 'PDF not found' });
-  }
-
-  const pdf = pdfDatabase[pdfIndex];
-  
-  if (fs.existsSync(pdf.path)) {
-    fs.unlinkSync(pdf.path);
-  }
-
-  pdfDatabase.splice(pdfIndex, 1);
-  res.json({ success: true, message: 'PDF deleted successfully' });
-});
-
-// Answer question using Groq AI
-app.post('/api/ask', async (req, res) => {
+// Get PDF content
+app.get('/api/pdf/:fileId', async (req, res) => {
   try {
-    const { question, language } = req.body;
-    console.log(`Received question: ${question} (Language: ${language})`);
+    const { fileId } = req.params;
+    const pdfData = pdfStorage.get(fileId);
+    
+    if (!pdfData) {
+      return res.status(404).json({ error: 'PDF not found' });
+    }
+    
+    res.json({
+      success: true,
+      data: pdfData
+    });
+  } catch (error) {
+    console.error('PDF retrieval error:', error);
+    res.status(500).json({ error: 'Failed to retrieve PDF' });
+  }
+});
+
+// Process question (text or voice)
+app.post('/api/ask-question', async (req, res) => {
+  try {
+    const { question, language = 'auto', fileId = null, audioData = null } = req.body;
+    
     if (!question) {
       return res.status(400).json({ error: 'Question is required' });
     }
 
-    // Check if API key is set
-    if (GROQ_API_KEY === 'YOUR_GROQ_API_KEY_HERE') {
-      // Fallback responses if no API key
-      const fallbackResponses = {
-        'en-IN': 'Lord Swaminarayan was born in Chhapaiya in 1781. He established the Swaminarayan Sampradaya and taught devotion, dharma, and moral living.',
-        'hi-IN': 'भगवान स्वामिनारायण का जन्म 1781 में छपैया में हुआ था। उन्होंने स्वामिनारायण संप्रदाय की स्थापना की और भक्ति, धर्म और नैतिक जीवन की शिक्षा दी।',
-        'gu-IN': 'ભગવાન સ્વામિનારાયણનો જન્મ 1781માં છપૈયામાં થયો હતો. તેમણે સ્વામિનારાયણ સંપ્રદાયની સ્થાપના કરી અને ભક્તિ, ધર્મ અને નૈતિક જીવનનો ઉપદેશ આપ્યો.'
-      };
-      
-      return res.json({ 
-        answer: fallbackResponses[language] || fallbackResponses['en-IN'] + ' (Demo mode - Set Groq API key for AI responses)'
-      });
-    }
-
-    // Combine all PDF texts
-    const context = pdfDatabase.map(pdf => pdf.text).join('\n\n').substring(0, 3000);
-    console.log(`Using context of ${context.length} characters from ${pdfDatabase.length} PDFs`);
-    // Language mapping
-    const languageNames = {
-      'en-IN': 'English',
-      'hi-IN': 'Hindi',
-      'gu-IN': 'Gujarati'
-    };
-
-    const responseLanguage = languageNames[language] || 'English';
-
-    // Create prompt
-    const prompt = `Context about Lord Swaminarayan:
-${context || 'Lord Swaminarayan (1781-1830) founded the Swaminarayan Sampradaya. Born in Chhapaiya, he taught devotion, dharma, and moral living.'}
-
-Question: ${question}
-
-Please answer in ${responseLanguage} language only. Keep the answer concise (2-3 sentences). Be respectful and accurate.`;
-
-    // Call Groq API
-    const answer = await callGroqAPI(prompt);
-
-    res.json({ answer: answer.trim() });
-  } catch (error) {
-    console.error('Error processing question:', error);
+    // Process audio if provided (base64 audio from frontend)
+    let processedQuestion = question;
     
-    // Fallback responses
-    const fallbackMessages = {
-      'en-IN': 'Lord Swaminarayan established many temples and taught the path of devotion. His teachings are preserved in the Vachanamrut.',
-      'hi-IN': 'भगवान स्वामिनारायण ने कई मंदिरों की स्थापना की और भक्ति का मार्ग सिखाया। उनकी शिक्षाएं वचनामृत में संरक्षित हैं।',
-      'gu-IN': 'ભગવાન સ્વામિનારાયણે ઘણા મંદિરો સ્થાપ્યા અને ભક્તિનો માર્ગ શીખવ્યો. તેમની શિક્ષાઓ વચનામૃતમાં સાચવેલી છે.'
-    };
-
+    if (audioData) {
+      // In a production app, you would use a speech-to-text service here
+      // For now, we'll assume the frontend has already converted it to text
+      processedQuestion = question || 'Audio processing not yet implemented';
+    }
+    
+    // Detect language if auto
+    let detectedLanguage = 'en';
+    if (language === 'auto') {
+      try {
+        const detection = await detectAndTranslate(processedQuestion, 'auto');
+        detectedLanguage = detection.detectedLanguage || 'en';
+      } catch (error) {
+        console.error('Language detection error:', error);
+      }
+    } else {
+      detectedLanguage = language;
+    }
+    
+    // Get context from uploaded PDF if provided
+    let context = '';
+    if (fileId && pdfStorage.has(fileId)) {
+      const pdfData = pdfStorage.get(fileId);
+      // Use first 3000 characters of PDF as context
+      context = pdfData.text.substring(0, 3000);
+    }
+    
+    // Generate AI response
+    const aiResponse = await generateAIResponse(processedQuestion, context, detectedLanguage);
+    
     res.json({
-      answer: fallbackMessages[req.body.language] || fallbackMessages['en-IN']
+      success: true,
+      question: processedQuestion,
+      answer: aiResponse,
+      language: detectedLanguage,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Question processing error:', error);
+    res.status(500).json({ 
+      error: 'Failed to process question', 
+      details: error.message 
     });
   }
 });
 
-// Health check
-app.get('/health', (req, res) => {
-  const apiStatus = GROQ_API_KEY !== 'YOUR_GROQ_API_KEY_HERE' ? 'Groq AI Active' : 'Demo Mode (No API Key)';
-  res.json({ 
-    status: 'ok', 
-    pdfsLoaded: pdfDatabase.length,
-    engine: apiStatus
+// Get available languages
+app.get('/api/languages', (req, res) => {
+  res.json({
+    success: true,
+    languages: [
+      { code: 'en', name: 'English' },
+      { code: 'gu', name: 'ગુજરાતી (Gujarati)' },
+      { code: 'hi', name: 'हिन्दी (Hindi)' },
+      { code: 'es', name: 'Español (Spanish)' },
+      { code: 'fr', name: 'Français (French)' },
+      { code: 'de', name: 'Deutsch (German)' },
+      { code: 'zh', name: '中文 (Chinese)' },
+      { code: 'ja', name: '日本語 (Japanese)' },
+      { code: 'ar', name: 'العربية (Arabic)' },
+      { code: 'pt', name: 'Português (Portuguese)' }
+    ]
   });
 });
 
-// Load existing PDFs on startup
-loadExistingPDFs().then(() => {
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`✅ Server running on http://0.0.0.0:${PORT}`);
-    console.log(`🌐 Web upload interface: http://localhost:${PORT}/upload`);
-    console.log(`📱 Use your local IP address in the React Native app`);
+// Text-to-speech endpoint (returns audio URL or base64)
+app.post('/api/text-to-speech', async (req, res) => {
+  try {
+    const { text, language = 'en' } = req.body;
     
-    if (GROQ_API_KEY === 'YOUR_GROQ_API_KEY_HERE') {
-      console.log(`⚠️  No Groq API key set - using fallback responses`);
-      console.log(`🔑 Get free API key at: https://console.groq.com/keys`);
-    } else {
-      console.log(`🤖 Using Groq AI with Llama 3 model`);
-    }
+    // In production, integrate with a TTS service like:
+    // - Google Cloud Text-to-Speech
+    // - Amazon Polly
+    // - Azure Cognitive Services
+    // - Open source: Mozilla TTS, Coqui TTS
     
-    console.log(`📚 ${pdfDatabase.length} PDFs loaded`);
-  });
+    // For demo purposes, returning a placeholder
+    res.json({
+      success: true,
+      audioUrl: null,
+      message: 'TTS integration pending. Use browser\'s Web Speech API for now.'
+    });
+  } catch (error) {
+    console.error('TTS error:', error);
+    res.status(500).json({ error: 'TTS failed' });
+  }
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`\n🚀 Server running on http://localhost:${PORT}`);
+  console.log(`📊 Health check: http://localhost:${PORT}/health`);
+  console.log(`🤖 AI Provider: Groq (Free & Fast)`);
+  
+  if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY') {
+    console.log('\n⚠️  WARNING: Groq API key is NOT configured!');
+    console.log('Get your FREE API key: https://console.groq.com/keys');
+    console.log('No credit card required! ✅\n');
+  } else {
+    console.log('✅ Groq API key is configured\n');
+  }
 });
