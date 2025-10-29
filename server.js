@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
 
 // Initialize Groq AI (FREE and FAST!)
 // Get your FREE API key from: https://console.groq.com/keys
-const GROQ_API_KEY = process.env.GROQ_API_KEY || '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';
+const GROQ_API_KEY = process.env.GROQ_API_KEY || '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';
 
 // Validate API key on startup
 if (!GROQ_API_KEY || GROQ_API_KEY === 'YOUR_GROQ_API_KEY') {
@@ -371,3 +371,4 @@ app.listen(PORT, () => {
     console.log('✅ Groq API key is configured\n');
   }
 });
+
